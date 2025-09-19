@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import os, sys, json, math, re, argparse, ssl, smtplib
+import os, sys, json, math, re, argparse, ssl, smtplib, time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import requests
@@ -44,6 +44,14 @@ PACK_RULES = [
     (r"AIKO.*\b605\b", 36),
 ]
 
+# --- Estados Holded (salesorder)
+STATUS_LABELS = {0: "Pendiente", 1: "Aceptado", 2: "Cancelado"}
+def status_label(n):
+    try:
+        return STATUS_LABELS.get(int(n), f"Desconocido({n})")
+    except Exception:
+        return f"Desconocido({n})"
+
 # ----------------------------- Helpers HTTP / tiempo -----------------------------
 def H():
     if not API_KEY:
@@ -78,6 +86,12 @@ def madrid_day_bounds_epoch_seconds(day_offset=0):
     end_mad   = datetime(target.year, target.month, target.day, 23, 59, 59, tzinfo=TZ_MADRID)
     return int(start_mad.astimezone(timezone.utc).timestamp()), int(end_mad.astimezone(timezone.utc).timestamp())
 
+def madrid_year_to_date_bounds_epoch_seconds():
+    now_mad = datetime.now(TZ_MADRID)
+    start_mad = datetime(now_mad.year, 1, 1, 0, 0, 0, tzinfo=TZ_MADRID)
+    end_mad   = now_mad
+    return int(start_mad.astimezone(timezone.utc).timestamp()), int(end_mad.astimezone(timezone.utc).timestamp())
+
 def fmt_eur(n, decimals=4):
     try:
         v = float(n or 0)
@@ -96,7 +110,7 @@ def get_salesorder(doc_id):
     r.raise_for_status()
     return r.json()
 
-def list_salesorders_between(start_epoch_utc, end_epoch_utc, page_limit=PAGE_LIMIT):
+def list_salesorders_between(start_epoch_utc, end_epoch_utc, page_limit=PAGE_LIMIT, verbose=False):
     url = f"{BASE_DOCS}/salesorder"
     page = 1
     out = []
@@ -109,8 +123,12 @@ def list_salesorders_between(start_epoch_utc, end_epoch_utc, page_limit=PAGE_LIM
         r.raise_for_status()
         batch = r.json()
         if not batch:
+            if verbose:
+                print(f"[fetch] page {page}: 0 docs")
             break
         out.extend(batch)
+        if verbose:
+            print(f"[fetch] page {page}: +{len(batch)} (total {len(out)})")
         if len(batch) < page_limit:
             break
         page += 1
@@ -130,20 +148,20 @@ def get_product(product_id):
     return data
 
 # ----------------------------- Helpers de estado -----------------------------
-def load_processed_ids(path):
+def load_status_map(path):
     try:
         p = Path(path)
         if not p.exists():
-            return set()
+            return {}
         data = json.loads(p.read_text(encoding="utf-8"))
-        return set(data if isinstance(data, list) else [])
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return set()
+        return {}
 
-def save_processed_ids(path, ids_set):
+def save_status_map(path, m):
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(sorted(ids_set), ensure_ascii=False, indent=2), encoding="utf-8")
+    p.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ----------------------------- Detectar Transporte por NOMBRE -----------------------------
 TRANSPORT_NAME_PATTERNS = [
@@ -156,7 +174,6 @@ TRANSPORT_NAME_PATTERNS = [
     r"^\s*portes?\s*$",
     r"^\s*env[ií]o\s*$",
 ]
-
 def is_transport_name(name: str) -> bool:
     n = (name or "").strip().lower()
     for pat in TRANSPORT_NAME_PATTERNS:
@@ -164,53 +181,22 @@ def is_transport_name(name: str) -> bool:
             return True
     return False
 
-
 # --- Comercial por tags ---
-SALESPERSON_TAGS = {
-    "tomi":  "Tomás",
-    "canet": "Jorge",
-    "supa":  "Susana",
-    "juanv": "Juan",
-}
+SALESPERSON_TAGS = {"tomi":"Tomás","canet":"Jorge","supa":"Susana","juanv":"Juan"}
 DEFAULT_SALESPERSON = "Juan"
-
 def infer_salesperson(line_tags, doc_tags):
-    """
-    Devuelve el nombre del comercial según los tags de la línea o del documento.
-    Prioriza tags de la línea; si no hay coincidencia, mira los del doc.
-    Si no encuentra, devuelve DEFAULT_SALESPERSON.
-    """
     def norm_tags(t):
-        if isinstance(t, list):
-            return [str(x).strip().lower() for x in t]
-        if isinstance(t, str):
-            return [t.strip().lower()]
+        if isinstance(t, list): return [str(x).strip().lower() for x in t]
+        if isinstance(t, str):  return [t.strip().lower()]
         return []
-
-    line_t = norm_tags(line_tags)
-    doc_t  = norm_tags(doc_tags)
-
+    line_t = norm_tags(line_tags); doc_t = norm_tags(doc_tags)
     for t in line_t:
-        if t in SALESPERSON_TAGS:
-            return SALESPERSON_TAGS[t]
+        if t in SALESPERSON_TAGS: return SALESPERSON_TAGS[t]
     for t in doc_t:
-        if t in SALESPERSON_TAGS:
-            return SALESPERSON_TAGS[t]
+        if t in SALESPERSON_TAGS: return SALESPERSON_TAGS[t]
     return DEFAULT_SALESPERSON
 
-
 # ----------------------------- Extractores robustos -----------------------------
-def dig(d, *keys, default=None):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict):
-            return default
-        if k in cur:
-            cur = cur[k]
-        else:
-            return default
-    return cur
-
 def try_fields(container, candidates, default=None):
     if not isinstance(container, dict):
         return default
@@ -244,12 +230,9 @@ def extract_power_w(product, *, item_name="", item_sku=""):
             return float(val)
         except Exception:
             pass
-    texts = [
-        item_name or "",
-        item_sku or "",
-        str(try_fields(product, ["name"]) or ""),
-        str(try_fields(product, ["sku"]) or ""),
-    ]
+    texts = [item_name or "", item_sku or "",
+             str(try_fields(product, ["name"]) or ""),
+             str(try_fields(product, ["sku"]) or "")]
     for txt in texts:
         m = re.findall(r"(?<!\d)(\d{3,4})\s*[Ww]\s*(?:[Pp])?", txt)
         cands = [int(x) for x in m if 300 <= int(x) <= 1000]
@@ -261,9 +244,7 @@ def extract_power_w(product, *, item_name="", item_sku=""):
             n = int(x)
             if 300 <= n <= 1000:
                 generic.append(n)
-    if generic:
-        return float(max(generic))
-    return 0.0
+    return float(max(generic)) if generic else 0.0
 
 def extract_units_per_pallet(product):
     val = try_fields(product, [
@@ -281,34 +262,27 @@ def compute_price_per_w(line_amount, qty, power_w):
     return 0.0
 
 def extract_transport_amount_from_doc(doc):
-    total = 0.0
-    found = False
+    total = 0.0; found = False
     for p in (doc.get("products") or []):
-        name = (p.get("name") or "")
-        if is_transport_name(name):
-            price = float(p.get("price") or 0)
-            units = float(p.get("units") or 0)
-            total += price * units
-            found = True
+        if is_transport_name(p.get("name") or ""):
+            price = float(p.get("price") or 0); units = float(p.get("units") or 0)
+            total += price * units; found = True
     return total if found else "-"
 
 def has_transport_line(doc):
     for p in (doc.get("products") or []):
-        if is_transport_name(p.get("name") or ""):
-            return True
+        if is_transport_name(p.get("name") or ""): return True
     return False
 
 def to_date_label(doc):
     v = doc.get("date") or doc.get("createdAt") or doc.get("issuedOn") or doc.get("updatedAt")
-    if v is None:
-        return "-"
+    if v is None: return "-"
     return to_madrid_str_from_epoch(v) if str(v).isdigit() else str(v)
 
 # ----------------------------- Normalización de líneas -----------------------------
 def iter_document_lines(doc):
     for it in (doc.get("products") or []):
         name = (it.get("name") or "").strip()
-        is_transport = is_transport_name(name)  # <-- SOLO por nombre
         yield {
             "name": name,
             "desc": it.get("desc"),
@@ -317,17 +291,13 @@ def iter_document_lines(doc):
             "amount": float(it.get("price") or 0) * float(it.get("units") or 0),
             "productId": it.get("productId"),
             "sku": (str(it.get("sku")) if it.get("sku") is not None else ""),
-            "is_transport": is_transport,
+            "is_transport": is_transport_name(name),
             "tags": it.get("tags") or [],
         }
 
-# ----------------------------- Inferencia de packs -----------------------------
+# ----------------------------- Packs / filas -----------------------------
 def hint_units_per_pallet_by_pattern(name="", sku="", product=None):
-    text = " ".join([
-        (name or ""), (sku or ""),
-        str((product or {}).get("name") or ""),
-        str((product or {}).get("sku") or "")
-    ])
+    text = " ".join([(name or ""), (sku or ""), str((product or {}).get("name") or ""), str((product or {}).get("sku") or "")])
     for pat, val in PACK_RULES:
         if re.search(pat, text, flags=re.IGNORECASE):
             return float(val)
@@ -343,32 +313,27 @@ def infer_units_per_pallet(product, *, name="", sku="", qty=0):
         return upp, "pattern", [], int(leftover)
     if qty:
         exact = [p for p in POSSIBLE_PACK_SIZES if qty % p == 0]
-        if len(exact) == 1:
-            return float(exact[0]), "divisible", [], 0
+        if len(exact) == 1: return float(exact[0]), "divisible", [], 0
         elif len(exact) > 1:
             preferred = 36 if 36 in exact else max(exact)
             others = [p for p in exact if p != preferred]
             return float(preferred), "ambiguous_divisible", others, 0
-        best_p = None
-        best_leftover = None
+        best_p = None; best_leftover = None
         for p in POSSIBLE_PACK_SIZES:
-            rem = qty % p
-            score = (rem, -p)
+            rem = qty % p; score = (rem, -p)
             if best_leftover is None or score < (best_leftover, -best_p):
-                best_leftover = rem
-                best_p = p
+                best_leftover = rem; best_p = p
         return float(best_p), "closest", [], int(best_leftover or 0)
     return 0.0, "unknown", [], 0
 
-def build_row(doc, line):
-    """€/W si hay potencia; si no, €/ud. Pallets solo si hay potencia."""
+def build_row(doc, line, *, fetch_product=False):
     cliente_name = doc.get("contactName") or "-"
     item_name = line["name"] or "-"
     qty = float(line["qty"] or 0)
     amount = float(line["amount"] or 0)
 
     product = {}
-    if line.get("productId"):
+    if fetch_product and line.get("productId"):
         try:
             product = get_product(line["productId"])
         except Exception:
@@ -379,24 +344,18 @@ def build_row(doc, line):
     pallets_display = "-"
     pallets_num = 0
     if power_w:
-        upp, _, _, leftover = infer_units_per_pallet(
-            product, name=item_name, sku=line.get("sku",""), qty=int(qty)
-        )
+        upp, _, _, leftover = infer_units_per_pallet(product, name=item_name, sku=line.get("sku",""), qty=int(qty))
         pallets = math.ceil(qty / upp) if (qty > 0 and upp > 0) else "-"
-        pallets_display = (
-            f"{int(pallets)} (+{leftover})" if (isinstance(pallets, (int,float)) and leftover)
-            else (str(int(pallets)) if pallets != "-" else "-")
-        )
+        pallets_display = (f"{int(pallets)} (+{leftover})" if (isinstance(pallets, (int,float)) and leftover)
+                           else (str(int(pallets)) if pallets != "-" else "-"))
         pallets_num = int(pallets) if isinstance(pallets, (int,float)) else 0
 
     if power_w:
         precio_valor = compute_price_per_w(amount, qty, power_w)   # €/W
-        precio_unidad = "€/W"
-        decs = 4
+        precio_unidad = "€/W"; decs = 4
     else:
         precio_valor = float(line.get("unit_price") or 0)          # €/ud
-        precio_unidad = "€/ud"
-        decs = 2
+        precio_unidad = "€/ud"; decs = 2
 
     return {
         "Fecha reserva": to_date_label(doc),
@@ -409,11 +368,9 @@ def build_row(doc, line):
         "PrecioValor": precio_valor,
         "PrecioUnidad": precio_unidad,
         "PrecioDecs": decs,
-        "Transporte": "-",  # se rellena luego solo en primera fila
+        "Transporte": "-",
         "Comercial": infer_salesperson(line.get("tags"), doc.get("tags")),
     }
-
-
 
 def _display_rows_for_console(rows):
     disp = []
@@ -429,61 +386,44 @@ def _display_rows_for_console(rows):
             "Cliente": str(r["Cliente"]),
             "Precio": precio_txt,
             "Transporte": transp_txt,
-            "Comercial": str(r["Comercial"]),   # 👈 AHORA ES LA ÚLTIMA
+            "Comercial": str(r["Comercial"]),
         })
     return disp
 
-
 def print_table(rows):
     if not rows:
-        print("No hay líneas que mostrar.")
-        return
-    # 👇 Orden con Comercial como ÚLTIMA columna
-    headers = [
-        "Fecha reserva","Material","Potencia (W)","Cantidad uds",
-        "Nº Pallets","Cliente","Precio","Transporte","Comercial"
-    ]
+        print("No hay líneas que mostrar."); return
+    headers = ["Fecha reserva","Material","Potencia (W)","Cantidad uds","Nº Pallets","Cliente","Precio","Transporte","Comercial"]
     disp = _display_rows_for_console(rows)
     widths = {h: max(len(h), max(len(d[h]) for d in disp)) for h in headers}
-    sep = " | "
-    line = "-+-".join("-"*widths[h] for h in headers)
-    print(sep.join(h.ljust(widths[h]) for h in headers))
-    print(line)
+    sep = " | "; line = "-+-".join("-"*widths[h] for h in headers)
+    print(sep.join(h.ljust(widths[h]) for h in headers)); print(line)
     for d in disp:
         print(sep.join(d[h].ljust(widths[h]) for h in headers))
 
-
 def dump_json(obj, path):
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[dump] JSON guardado en: {path}")
 
 # ----------------------------- Email -----------------------------
 def build_email_subject(doc, rows):
-    """Con pallets: VENDIDO {n_pallets} pallets {material} a {Cliente}
-       Sin pallets: VENDIDO {n_unidades} uds {material} a {Cliente}."""
     cliente = doc.get("contactName") or "-"
-
     if rows:
         materials = [r.get("Material") or "-" for r in rows]
         distinct = []
         for m in materials:
-            if m not in distinct:
-                distinct.append(m)
+            if m not in distinct: distinct.append(m)
         material_label = distinct[0] if len(distinct) <= 1 else f"{distinct[0]} (+{len(distinct)-1} más)"
     else:
         material_label = "Transporte" if has_transport_line(doc) else "Sin líneas"
-
     pallets_total = sum(int(r.get("PalletsNum") or 0) for r in rows) if rows else 0
-
     if pallets_total > 0:
-        qty = pallets_total
-        unit_word = "pallets" if qty != 1 else "pallet"
+        qty = pallets_total; unit_word = "pallets" if qty != 1 else "pallet"
     else:
         units_total = sum(int(r.get("Cantidad uds") or 0) for r in rows) if rows else 0
-        qty = units_total
-        unit_word = "uds" if qty != 1 else "ud"
-
+        qty = units_total; unit_word = "uds" if qty != 1 else "ud"
     return f"VENDIDO {qty} {unit_word} {material_label} a {cliente}"
 
 def build_html_table(doc, rows):
@@ -491,19 +431,12 @@ def build_html_table(doc, rows):
     cliente = doc.get("contactName") or "-"
     fecha = to_date_label(doc)
     transporte_amount = extract_transport_amount_from_doc(doc)
-
     head = (
         f"<h3 style='margin:0 0 8px'>Reserva de material — Pedido {number}</h3>"
         f"<p style='margin:0 0 10px'>Cliente: <b>{cliente}</b> &nbsp;|&nbsp; Fecha: <b>{fecha}</b>"
         f" &nbsp;|&nbsp; Transporte: <b>{(fmt_eur(transporte_amount,2) if isinstance(transporte_amount,(int,float)) else transporte_amount)}</b></p>"
     )
-
-    # 👇 Comercial es la ÚLTIMA columna
-    headers = [
-        "Fecha reserva","Material","Potencia (W)","Cantidad uds",
-        "Nº Pallets","Cliente","Precio","Transporte","Comercial"
-    ]
-
+    headers = ["Fecha reserva","Material","Potencia (W)","Cantidad uds","Nº Pallets","Cliente","Precio","Transporte","Comercial"]
     tr = []
     for r in rows:
         precio_html = fmt_eur(r["PrecioValor"], r["PrecioDecs"]).replace(" €", f" {r['PrecioUnidad']}")
@@ -518,21 +451,16 @@ def build_html_table(doc, rows):
             f"<td>{r['Cliente']}</td>"
             f"<td style='text-align:right'>{precio_html}</td>"
             f"<td style='text-align:right'>{transp_html}</td>"
-            f"<td>{r['Comercial']}</td>"   # 👈 ÚLTIMA CELDA
+            f"<td>{r['Comercial']}</td>"
             "</tr>"
         )
-
     body = (
         "<table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse'>"
-        "<thead><tr>"
-        + "".join(f"<th>{h}</th>" for h in headers) +
-        "</tr></thead>"
+        "<thead><tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr></thead>"
         f"<tbody>{''.join(tr) if tr else '<tr><td colspan=9>Sin líneas</td></tr>'}</tbody>"
         "</table>"
     )
-
     return "<div style='font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif'>" + head + body + "</div>"
-
 
 def send_email(subject, html):
     missing = [k for k,v in {
@@ -541,60 +469,59 @@ def send_email(subject, html):
     }.items() if not v]
     if missing:
         raise SystemExit(f"Faltan variables SMTP en entorno: {', '.join(missing)}")
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = MAIL_FROM
-    msg["To"] = MAIL_TO
+    msg = MIMEMultipart("alternative"); msg["Subject"] = subject; msg["From"] = MAIL_FROM; msg["To"] = MAIL_TO
     msg.attach(MIMEText(html, "html"))
-
     recipients = [e.strip() for e in (MAIL_TO or "").split(",") if e.strip()]
-
     try:
         if SMTP_PORT == 465:
             context = ssl.create_default_context()
             with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=60) as server:
-                server.login(SMTP_USER, SMTP_PASS)
-                server.sendmail(MAIL_FROM, recipients, msg.as_string())
+                server.login(SMTP_USER, SMTP_PASS); server.sendmail(MAIL_FROM, recipients, msg.as_string())
         else:
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(SMTP_USER, SMTP_PASS)
-                server.sendmail(MAIL_FROM, recipients, msg.as_string())
+                server.ehlo(); server.starttls(); server.ehlo()
+                server.login(SMTP_USER, SMTP_PASS); server.sendmail(MAIL_FROM, recipients, msg.as_string())
     except smtplib.SMTPAuthenticationError as e:
-        raise SystemExit(
-            "Autenticación SMTP fallida (535). En Gmail usa una CONTRASEÑA DE APLICACIÓN "
-            "y verifica que MAIL_FROM = SMTP_USER."
-        ) from e
+        raise SystemExit("Autenticación SMTP fallida (535). En Gmail usa contraseña de aplicación y MAIL_FROM=SMTP_USER.") from e
 
 # ----------------------------- Main -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Poller de Sales Orders (Holded) → reserva (+ email opcional)")
-    g = ap.add_mutually_exclusive_group(required=True)
+    ap = argparse.ArgumentParser(description="SO monitor (Holded) — Rango + emails por transiciones")
+    g = ap.add_mutually_exclusive_group(required=False)
     g.add_argument("--doc-id", help="ID de documento (salesorder) a descargar")
     g.add_argument("--minutes", type=int, help="Buscar pedidos creados en los últimos X minutos")
     g.add_argument("--days", type=int, help="Buscar pedidos de los últimos N días incluyendo hoy (1 = hoy+yesterday)")
-    ap.add_argument("--limit", type=int, default=200, help="Máximo de documentos a procesar")
+    ap.add_argument("--ytd", action="store_true", help="Todo el año en curso hasta ahora (si no pasas --days/--minutes/--doc-id)")
+    ap.add_argument("--limit", type=int, default=100000, help="Máximo de documentos a procesar")
     ap.add_argument("--dump-json", help="Ruta base para volcar el JSON crudo de cada documento (añade sufijo con el id)")
-    ap.add_argument("--send-email", action="store_true", help="Enviar email con la tabla para cada documento procesado")
-    ap.add_argument("--state-file", default=".state/processed_salesorders.json",
-                    help="Ruta al JSON de IDs ya procesados (para evitar duplicados)")
+    ap.add_argument("--send-email", dest="send_email", action="store_true",
+                    help="Enviar email solo cuando haya transición (VENDIDO/CANCELADO) o NEW_ACCEPTED")
+    ap.add_argument("--email-new-accepted", dest="email_new_accepted", action="store_true",
+                    help="Enviar VENDIDO si es la primera vez que lo vemos y ya está Pendiente/Aceptado")
+    ap.add_argument("--status-file", default="state/so_status.json",
+                    help="Mapa {doc_id: status} para detectar transiciones (se actualiza al final)")
+    ap.add_argument("--quiet", action="store_true", help="Logs mínimos (ideal CI)")
+    ap.add_argument("--verbose", action="store_true", help="Logs de progreso de fetch/paginación")
+    ap.add_argument("--fetch-product", action="store_true", help="Activar llamadas a ficha de producto (más lento)")
     args = ap.parse_args()
 
-    # Obtener docs según el modo
+    t0 = time.perf_counter()
+
+    # Obtener docs según el modo (por defecto YTD)
     if args.doc_id:
         docs = [get_salesorder(args.doc_id)]
     elif args.minutes:
         start, end = utc_bounds_last_minutes(args.minutes)
-        docs = list_salesorders_between(start, end)
-    else:  # args.days
+        docs = list_salesorders_between(start, end, verbose=args.verbose)
+    elif args.days is not None:
         days = max(0, int(args.days or 0))
-        docs = []
-        for d in range(0, -(days) - 1, -1):  # 0, -1, -2, ...
-            s, e = madrid_day_bounds_epoch_seconds(day_offset=d)
-            docs.extend(list_salesorders_between(s, e))
+        start_utc, _ = madrid_day_bounds_epoch_seconds(day_offset=-days)
+        _, end_utc   = madrid_day_bounds_epoch_seconds(day_offset=0)
+        docs = list_salesorders_between(start_utc, end_utc, verbose=args.verbose)
+    else:
+        # YTD por defecto si no se especifica otra cosa
+        start_utc, end_utc = madrid_year_to_date_bounds_epoch_seconds()
+        docs = list_salesorders_between(start_utc, end_utc, verbose=args.verbose)
 
     # Deduplicar por ID y ordenar por fecha (si hay)
     def _doc_id(d):
@@ -615,49 +542,82 @@ def main():
         print("No se han encontrado documentos en la ventana solicitada.")
         return
 
-    # Cargar estado y filtrar nuevos
-    processed = load_processed_ids(args.state_file)
-    docs_new = [d for d in docs if _doc_id(d) and _doc_id(d) not in processed]
+    status_map = load_status_map(args.status_file)
 
-    if not docs_new and not args.doc_id:
-        print("No hay documentos NUEVOS para procesar.")
-        return
+    sent_vendidos = 0
+    sent_cancelados = 0
 
-    for doc in (docs_new if not args.doc_id else docs):
+    for idx, doc in enumerate(docs, 1):
         doc_id = _doc_id(doc)
         number = doc.get("number") or doc.get("code") or doc.get("docNumber") or doc_id
-        print(f"\n=== Sales Order: {number} (id: {doc_id}) ===")
+        cliente = doc.get("contactName") or "-"
+        cur_status = doc.get("status")
+        prev_status = status_map.get(doc_id, None)
 
+        # dump JSON crudo (si se pide)
         if args.dump_json:
-            dump_json(doc, f"{args.dump_json.rstrip('.json')}_{doc_id}.json")
+            out_path = f"{args.dump_json.rstrip('.json')}_{doc_id}.json"
+            dump_json(doc, out_path)
 
+        # Construcción de filas (sin ficha producto por defecto → rápido)
         lines = list(iter_document_lines(doc))
         material_lines = [ln for ln in lines if not ln.get("is_transport")]
-
-        rows = [build_row(doc, ln) for ln in material_lines]
-
-        # Transporte global solo en la PRIMERA fila
+        rows = [build_row(doc, ln, fetch_product=args.fetch_product) for ln in material_lines]
         transp_amount = extract_transport_amount_from_doc(doc)
         for i, r in enumerate(rows):
             r["Transporte"] = transp_amount if i == 0 else "-"
 
-        print_table(rows)
+        if not args.quiet:
+            print(f"\n[{idx}/{len(docs)}] === Sales Order: {number} (id: {doc_id}) ===")
+            print(f"Estado actual: {status_label(cur_status)}"
+                  + ("" if prev_status is None else f" (antes: {status_label(prev_status)})"))
+            print_table(rows)
 
-        if args.send_email:
-            html = build_html_table(doc, rows)
-            subject = build_email_subject(doc, rows)
-            send_email(subject, html)
-            print("Email enviado.")
+        # Transiciones → decidir envío
+        send_reason = None
+        if prev_status is not None and cur_status is not None:
+            if int(prev_status) == 2 and int(cur_status) in (0, 1):
+                send_reason = "REOPENED_TO_SALE"   # Cancelado -> Pendiente/Aceptado
+            elif int(prev_status) in (0, 1) and int(cur_status) == 2:
+                send_reason = "CANCELLED"          # Pendiente/Aceptado -> Cancelado
+        elif prev_status is None and cur_status is not None:
+            if args.email_new_accepted and int(cur_status) in (0, 1):
+                send_reason = "NEW_ACCEPTED"       # Primera vez visto y ya está vendible
 
-        # Marcar como procesado y GUARDAR INCREMENTALMENTE (salvo --doc-id)
-        if not args.doc_id:
-            processed.add(doc_id)
-            save_processed_ids(args.state_file, processed)
+        if args.send_email and send_reason:
+            if send_reason in ("REOPENED_TO_SALE", "NEW_ACCEPTED"):
+                subject = build_email_subject(doc, rows)
+                html = build_html_table(doc, rows)
+                send_email(subject, html)
+                sent_vendidos += 1
+                if not args.quiet:
+                    print(f"Email enviado (VENDIDO) — motivo: {send_reason}.")
+            elif send_reason == "CANCELLED":
+                subj_cancel = f"CANCELADO pedido {number} — {cliente}"
+                html_cancel = (
+                    "<div style='font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif'>"
+                    f"<h3 style='margin:0 0 8px'>Pedido CANCELADO — {number}</h3>"
+                    f"<p style='margin:0 10px 10px 0'>Cliente: <b>{cliente}</b> | Fecha: <b>{to_date_label(doc)}</b> | Estado: <b>{status_label(cur_status)}</b></p>"
+                    + build_html_table(doc, rows) +
+                    "</div>"
+                )
+                send_email(subj_cancel, html_cancel)
+                sent_cancelados += 1
+                if not args.quiet:
+                    print("Email enviado (CANCELADO).")
 
-    # Guardado final (por si acaso)
-    if not args.doc_id:
-        save_processed_ids(args.state_file, processed)
-        print(f"[estado] Guardados {len(processed)} IDs en {args.state_file}")
+        # Actualizar estado conocido (id -> status)
+        if cur_status is not None:
+            status_map[doc_id] = int(cur_status)
+
+    # Guardado final de mapa de estados
+    save_status_map(args.status_file, status_map)
+
+    t1 = time.perf_counter()
+    if args.quiet:
+        print(f"[ok] docs={len(docs)} vendidos={sent_vendidos} cancelados={sent_cancelados} t={t1 - t0:.2f}s")
+    else:
+        print(f"\n[resumen] Documentos: {len(docs)} | Emails VENDIDO: {sent_vendidos} | Emails CANCELADO: {sent_cancelados} | Tiempo: {t1 - t0:.2f}s")
 
 if __name__ == "__main__":
     try:
