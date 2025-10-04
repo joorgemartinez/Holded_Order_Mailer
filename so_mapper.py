@@ -44,13 +44,35 @@ PACK_RULES = [
     (r"AIKO.*\b605\b", 36),
 ]
 
-# --- Estados Holded (salesorder)
-STATUS_LABELS = {0: "Pendiente", 1: "Aceptado", 2: "Cancelado"}
+# --- Estados Holded (salesorder) con convención interna ---
+# Convención interna: 0=Pendiente, 1=Aceptado, -1=Cancelado
+STATUS_LABELS = {0: "Pendiente", 1: "Aceptado", -1: "Cancelado"}
+CANCELLED = -1
+
 def status_label(n):
     try:
         return STATUS_LABELS.get(int(n), f"Desconocido({n})")
     except Exception:
         return f"Desconocido({n})"
+
+def normalize_status(val):
+    """
+    Mapea el estado crudo (API/JSON) a la convención interna:
+      0 -> 0 (Pendiente)
+      1 -> 1 (Aceptado)
+      2 -> -1 (Cancelado API -> Cancelado interno)
+     -1 -> -1 (Cancelado interno)
+    Cualquier otro -> None (desconocido/no usable para transiciones)
+    """
+    try:
+        n = int(val)
+    except Exception:
+        return None
+    if n == 2:
+        return -1
+    if n in (0, 1, -1):
+        return n
+    return None
 
 # ----------------------------- Helpers HTTP / tiempo -----------------------------
 def H():
@@ -551,8 +573,9 @@ def main():
         doc_id = _doc_id(doc)
         number = doc.get("number") or doc.get("code") or doc.get("docNumber") or doc_id
         cliente = doc.get("contactName") or "-"
-        cur_status = doc.get("status")
-        prev_status = status_map.get(doc_id, None)
+        # Normalización de estados
+        cur_status = normalize_status(doc.get("status"))
+        prev_status = normalize_status(status_map.get(doc_id, None))
 
         # dump JSON crudo (si se pide)
         if args.dump_json:
@@ -575,14 +598,15 @@ def main():
 
         # Transiciones → decidir envío
         send_reason = None
-        if prev_status is not None and cur_status is not None:
-            if int(prev_status) == 2 and int(cur_status) in (0, 1):
-                send_reason = "REOPENED_TO_SALE"   # Cancelado -> Pendiente/Aceptado
-            elif int(prev_status) in (0, 1) and int(cur_status) == 2:
-                send_reason = "CANCELLED"          # Pendiente/Aceptado -> Cancelado
+        if (prev_status is not None) and (cur_status is not None):
+            if prev_status == CANCELLED and cur_status in (0, 1):
+                send_reason = "REOPENED_TO_SALE"   # Cancelado(-1) -> Pendiente/Aceptado
+            elif prev_status in (0, 1) and cur_status == CANCELLED:
+                send_reason = "CANCELLED"          # Pendiente/Aceptado -> Cancelado(-1)
         elif prev_status is None and cur_status is not None:
-            if args.email_new_accepted and int(cur_status) in (0, 1):
-                send_reason = "NEW_ACCEPTED"       # Primera vez visto y ya está vendible
+            if args.email_new_accepted and cur_status in (0, 1):
+                send_reason = "NEW_ACCEPTED"
+            # (si en el futuro añades --email-new-cancelled, podrías manejar NEW_CANCELLED aquí)
 
         if args.send_email and send_reason:
             if send_reason in ("REOPENED_TO_SALE", "NEW_ACCEPTED"):
@@ -606,9 +630,9 @@ def main():
                 if not args.quiet:
                     print("Email enviado (CANCELADO).")
 
-        # Actualizar estado conocido (id -> status)
+        # Actualizar estado conocido (id -> status) ya normalizado (0/1/-1)
         if cur_status is not None:
-            status_map[doc_id] = int(cur_status)
+            status_map[doc_id] = cur_status
 
     # Guardado final de mapa de estados
     save_status_map(args.status_file, status_map)
