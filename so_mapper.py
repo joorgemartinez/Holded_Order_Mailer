@@ -109,9 +109,14 @@ def madrid_day_bounds_epoch_seconds(day_offset=0):
     return int(start_mad.astimezone(timezone.utc).timestamp()), int(end_mad.astimezone(timezone.utc).timestamp())
 
 def madrid_year_to_date_bounds_epoch_seconds():
+    """
+    Devuelve (start_utc, end_utc) desde el 1 de enero del año actual
+    hasta el final del día actual (23:59:59). Así incluimos pedidos creados
+    después de la hora de ejecución.
+    """
     now_mad = datetime.now(TZ_MADRID)
     start_mad = datetime(now_mad.year, 1, 1, 0, 0, 0, tzinfo=TZ_MADRID)
-    end_mad   = now_mad
+    end_mad   = datetime(now_mad.year, now_mad.month, now_mad.day, 23, 59, 59, tzinfo=TZ_MADRID)
     return int(start_mad.astimezone(timezone.utc).timestamp()), int(end_mad.astimezone(timezone.utc).timestamp())
 
 def fmt_eur(n, decimals=4):
@@ -517,9 +522,12 @@ def main():
     ap.add_argument("--limit", type=int, default=100000, help="Máximo de documentos a procesar")
     ap.add_argument("--dump-json", help="Ruta base para volcar el JSON crudo de cada documento (añade sufijo con el id)")
     ap.add_argument("--send-email", dest="send_email", action="store_true",
-                    help="Enviar email solo cuando haya transición (VENDIDO/CANCELADO) o NEW_ACCEPTED")
+                    help="Enviar email solo cuando haya transición (VENDIDO/CANCELADO) o NEW_*")
     ap.add_argument("--email-new-accepted", dest="email_new_accepted", action="store_true",
                     help="Enviar VENDIDO si es la primera vez que lo vemos y ya está Pendiente/Aceptado")
+    # NUEVA FLAG:
+    ap.add_argument("--email-new-any", dest="email_new_any", action="store_true",
+                    help="Enviar email la primera vez que veamos un pedido nuevo (de cualquier estado)")
     ap.add_argument("--status-file", default="state/so_status.json",
                     help="Mapa {doc_id: status} para detectar transiciones (se actualiza al final)")
     ap.add_argument("--quiet", action="store_true", help="Logs mínimos (ideal CI)")
@@ -544,6 +552,14 @@ def main():
         # YTD por defecto si no se especifica otra cosa
         start_utc, end_utc = madrid_year_to_date_bounds_epoch_seconds()
         docs = list_salesorders_between(start_utc, end_utc, verbose=args.verbose)
+
+        # Unión defensiva con HOY completo (por si algún pedido de hoy no entra en la query YTD)
+        s_today, e_today = madrid_day_bounds_epoch_seconds(day_offset=0)
+        if args.verbose:
+            print("[union] añadiendo ventana HOY (00:00–23:59) a resultados YTD")
+        docs_today = list_salesorders_between(s_today, e_today, verbose=args.verbose)
+        docs.extend(docs_today)
+
 
     # Deduplicar por ID y ordenar por fecha (si hay)
     def _doc_id(d):
@@ -606,10 +622,11 @@ def main():
         elif prev_status is None and cur_status is not None:
             if args.email_new_accepted and cur_status in (0, 1):
                 send_reason = "NEW_ACCEPTED"
-            # (si en el futuro añades --email-new-cancelled, podrías manejar NEW_CANCELLED aquí)
+            elif args.email_new_any:
+                send_reason = "NEW_ANY"
 
         if args.send_email and send_reason:
-            if send_reason in ("REOPENED_TO_SALE", "NEW_ACCEPTED"):
+            if send_reason in ("REOPENED_TO_SALE", "NEW_ACCEPTED", "NEW_ANY"):
                 subject = build_email_subject(doc, rows)
                 html = build_html_table(doc, rows)
                 send_email(subject, html)
@@ -617,14 +634,32 @@ def main():
                 if not args.quiet:
                     print(f"Email enviado (VENDIDO) — motivo: {send_reason}.")
             elif send_reason == "CANCELLED":
+                # --- MAIL DE CANCELACIÓN SIMPLIFICADO ---
                 subj_cancel = f"CANCELADO pedido {number} — {cliente}"
-                html_cancel = (
-                    "<div style='font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif'>"
-                    f"<h3 style='margin:0 0 8px'>Pedido CANCELADO — {number}</h3>"
-                    f"<p style='margin:0 10px 10px 0'>Cliente: <b>{cliente}</b> | Fecha: <b>{to_date_label(doc)}</b> | Estado: <b>{status_label(cur_status)}</b></p>"
-                    + build_html_table(doc, rows) +
-                    "</div>"
-                )
+
+                mat_lines = [ln for ln in iter_document_lines(doc) if not ln.get("is_transport")]
+                html_lines = ""
+                for ln in mat_lines:
+                    nombre = ln.get("name") or "-"
+                    cantidad = int(ln.get("qty") or 0)
+                    html_lines += f"<li>{nombre} — <b>{cantidad}</b> uds</li>"
+                if not html_lines:
+                    html_lines = "<li>Sin líneas de material</li>"
+
+                html_cancel = f"""
+                <div style='font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif'>
+                    <h3 style='margin:0 0 8px;color:#b30000'>❌ Pedido CANCELADO — {number}</h3>
+                    <p style='margin:0 0 8px'>
+                        Cliente: <b>{cliente}</b><br>
+                        Fecha: <b>{to_date_label(doc)}</b><br>
+                        Estado: <b>{status_label(cur_status)}</b>
+                    </p>
+                    <p style='margin:10px 0 4px;font-weight:bold'>Material cancelado:</p>
+                    <ul style='margin:0 0 10px 20px;padding:0'>
+                        {html_lines}
+                    </ul>
+                </div>
+                """
                 send_email(subj_cancel, html_cancel)
                 sent_cancelados += 1
                 if not args.quiet:
