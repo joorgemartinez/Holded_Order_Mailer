@@ -111,8 +111,7 @@ def madrid_day_bounds_epoch_seconds(day_offset=0):
 def madrid_year_to_date_bounds_epoch_seconds():
     """
     Devuelve (start_utc, end_utc) desde el 1 de enero del año actual
-    hasta el final del día actual (23:59:59). Así incluimos pedidos creados
-    después de la hora de ejecución.
+    hasta el final del día actual (23:59:59).
     """
     now_mad = datetime.now(TZ_MADRID)
     start_mad = datetime(now_mad.year, 1, 1, 0, 0, 0, tzinfo=TZ_MADRID)
@@ -522,12 +521,12 @@ def main():
     ap.add_argument("--limit", type=int, default=100000, help="Máximo de documentos a procesar")
     ap.add_argument("--dump-json", help="Ruta base para volcar el JSON crudo de cada documento (añade sufijo con el id)")
     ap.add_argument("--send-email", dest="send_email", action="store_true",
-                    help="Enviar email solo cuando haya transición (VENDIDO/CANCELADO) o NEW_*")
+                    help="Enviar email cuando haya transición o cuando el pedido se vea por primera vez")
+    # Flags opcionales de compatibilidad (ya no necesarias para el primer envío):
     ap.add_argument("--email-new-accepted", dest="email_new_accepted", action="store_true",
-                    help="Enviar VENDIDO si es la primera vez que lo vemos y ya está Pendiente/Aceptado")
-    # NUEVA FLAG:
+                    help="(Opcional) Forzar VENDIDO solo si el primer estado es Pendiente/Aceptado")
     ap.add_argument("--email-new-any", dest="email_new_any", action="store_true",
-                    help="Enviar email la primera vez que veamos un pedido nuevo (de cualquier estado)")
+                    help="(Opcional) Forzar VENDIDO si es la primera vez (cualquier estado)")
     ap.add_argument("--status-file", default="state/so_status.json",
                     help="Mapa {doc_id: status} para detectar transiciones (se actualiza al final)")
     ap.add_argument("--quiet", action="store_true", help="Logs mínimos (ideal CI)")
@@ -537,7 +536,7 @@ def main():
 
     t0 = time.perf_counter()
 
-    # Obtener docs según el modo (por defecto YTD)
+    # Obtener docs según el modo (por defecto YTD + HOY)
     if args.doc_id:
         docs = [get_salesorder(args.doc_id)]
     elif args.minutes:
@@ -549,19 +548,16 @@ def main():
         _, end_utc   = madrid_day_bounds_epoch_seconds(day_offset=0)
         docs = list_salesorders_between(start_utc, end_utc, verbose=args.verbose)
     else:
-        # YTD por defecto si no se especifica otra cosa
         start_utc, end_utc = madrid_year_to_date_bounds_epoch_seconds()
         docs = list_salesorders_between(start_utc, end_utc, verbose=args.verbose)
-
-        # Unión defensiva con HOY completo (por si algún pedido de hoy no entra en la query YTD)
+        # Unión defensiva con HOY completo
         s_today, e_today = madrid_day_bounds_epoch_seconds(day_offset=0)
         if args.verbose:
             print("[union] añadiendo ventana HOY (00:00–23:59) a resultados YTD")
         docs_today = list_salesorders_between(s_today, e_today, verbose=args.verbose)
         docs.extend(docs_today)
 
-
-    # Deduplicar por ID y ordenar por fecha (si hay)
+    # Deduplicar por ID y ordenar por fecha
     def _doc_id(d):
         return d.get("_id") or d.get("id") or d.get("docNumber") or d.get("number") or ""
     uniq = {}
@@ -589,16 +585,18 @@ def main():
         doc_id = _doc_id(doc)
         number = doc.get("number") or doc.get("code") or doc.get("docNumber") or doc_id
         cliente = doc.get("contactName") or "-"
-        # Normalización de estados
-        cur_status = normalize_status(doc.get("status"))
-        prev_status = normalize_status(status_map.get(doc_id, None))
 
-        # dump JSON crudo (si se pide)
+        # Normalización de estados y detección de "primer vistazo"
+        cur_status  = normalize_status(doc.get("status"))
+        prev_status = normalize_status(status_map.get(doc_id, None))
+        first_seen  = (doc_id not in status_map)  # <--- CLAVE: nuevo pedido detectado
+
+        # Dump JSON (si se pide)
         if args.dump_json:
             out_path = f"{args.dump_json.rstrip('.json')}_{doc_id}.json"
             dump_json(doc, out_path)
 
-        # Construcción de filas (sin ficha producto por defecto → rápido)
+        # Filas (sin ficha producto por defecto → rápido)
         lines = list(iter_document_lines(doc))
         material_lines = [ln for ln in lines if not ln.get("is_transport")]
         rows = [build_row(doc, ln, fetch_product=args.fetch_product) for ln in material_lines]
@@ -608,22 +606,34 @@ def main():
 
         if not args.quiet:
             print(f"\n[{idx}/{len(docs)}] === Sales Order: {number} (id: {doc_id}) ===")
-            print(f"Estado actual: {status_label(cur_status)}"
-                  + ("" if prev_status is None else f" (antes: {status_label(prev_status)})"))
+            if first_seen:
+                print("Estado actual: (nuevo documento) " + (status_label(cur_status) if cur_status is not None else "Sin estado reconocible"))
+            else:
+                if prev_status is not None:
+                    print(f"Estado actual: {status_label(cur_status)} (antes: {status_label(prev_status)})")
+                else:
+                    print(f"Estado actual: {status_label(cur_status)}")
             print_table(rows)
 
-        # Transiciones → decidir envío
+        # --- Decidir envíos ---
         send_reason = None
-        if (prev_status is not None) and (cur_status is not None):
-            if prev_status == CANCELLED and cur_status in (0, 1):
-                send_reason = "REOPENED_TO_SALE"   # Cancelado(-1) -> Pendiente/Aceptado
-            elif prev_status in (0, 1) and cur_status == CANCELLED:
-                send_reason = "CANCELLED"          # Pendiente/Aceptado -> Cancelado(-1)
-        elif prev_status is None and cur_status is not None:
-            if args.email_new_accepted and cur_status in (0, 1):
-                send_reason = "NEW_ACCEPTED"
-            elif args.email_new_any:
-                send_reason = "NEW_ANY"
+
+        if first_seen:
+            # En cuanto nace un pedido, enviamos (comportamiento del script 1)
+            send_reason = "NEW_ANY"
+        else:
+            # Transiciones clásicas
+            if (prev_status is not None) and (cur_status is not None):
+                if prev_status == CANCELLED and cur_status in (0, 1):
+                    send_reason = "REOPENED_TO_SALE"
+                elif prev_status in (0, 1) and cur_status == CANCELLED:
+                    send_reason = "CANCELLED"
+            # Flags opcionales, por si quieres afinar (no necesarias ya)
+            if send_reason is None and prev_status is None and cur_status is not None:
+                if args.email_new_accepted and cur_status in (0, 1):
+                    send_reason = "NEW_ACCEPTED"
+                elif args.email_new_any:
+                    send_reason = "NEW_ANY"
 
         if args.send_email and send_reason:
             if send_reason in ("REOPENED_TO_SALE", "NEW_ACCEPTED", "NEW_ANY"):
@@ -634,9 +644,7 @@ def main():
                 if not args.quiet:
                     print(f"Email enviado (VENDIDO) — motivo: {send_reason}.")
             elif send_reason == "CANCELLED":
-                # --- MAIL DE CANCELACIÓN SIMPLIFICADO ---
                 subj_cancel = f"CANCELADO pedido {number} — {cliente}"
-
                 mat_lines = [ln for ln in iter_document_lines(doc) if not ln.get("is_transport")]
                 html_lines = ""
                 for ln in mat_lines:
@@ -645,7 +653,6 @@ def main():
                     html_lines += f"<li>{nombre} — <b>{cantidad}</b> uds</li>"
                 if not html_lines:
                     html_lines = "<li>Sin líneas de material</li>"
-
                 html_cancel = f"""
                 <div style='font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif'>
                     <h3 style='margin:0 0 8px;color:#b30000'>❌ Pedido CANCELADO — {number}</h3>
@@ -668,6 +675,11 @@ def main():
         # Actualizar estado conocido (id -> status) ya normalizado (0/1/-1)
         if cur_status is not None:
             status_map[doc_id] = cur_status
+        else:
+            # Si no pudimos normalizar estado pero es la primera vez que lo vemos,
+            # persistimos un marcador neutro para que no vuelva a disparar NEW_ANY.
+            if first_seen:
+                status_map[doc_id] = "seen"
 
     # Guardado final de mapa de estados
     save_status_map(args.status_file, status_map)
